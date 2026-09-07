@@ -175,6 +175,7 @@ async def run_in_batches(
 
 # ---------- main ----------
 if __name__ == "__main__":
+    from .store import connect, write_run, write_answers
     settings = Settings()
 
     questions = load_questions(settings.questions_csv)
@@ -210,6 +211,14 @@ if __name__ == "__main__":
             },
             indent=2,
         )
+    )
+
+    with connect(settings.results_db) as con:
+        run_id = write_run(con, summary)
+        n = write_answers(con, run_id, answers)
+
+    log.info(
+        f"persisted run {run_id} with {n} answers to {settings.results_db}"
     )
 
     print(

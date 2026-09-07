@@ -18,7 +18,7 @@ class Settings(BaseModel):
 
     model: str = "gpt-4o-mini"
     #use_fake: bool = True
-    use_fake: bool = False
+    use_fake: bool = True
 
 
 class RunSummary(BaseModel):
