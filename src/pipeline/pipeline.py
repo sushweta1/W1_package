@@ -23,6 +23,7 @@ import json
 import logging
 import time
 import csv
+import argparse
 from pathlib import Path
 
 
@@ -178,7 +179,20 @@ if __name__ == "__main__":
     from .store import connect, write_run, write_answers
     settings = Settings()
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N questions",
+    )
+    args = parser.parse_args()
+
     questions = load_questions(settings.questions_csv)
+
+    if args.limit is not None:
+        questions = questions[:args.limit]
+
     log.info(f"loaded {len(questions)} questions")
 
     started = time.time()
