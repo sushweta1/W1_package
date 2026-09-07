@@ -22,20 +22,89 @@ import asyncio
 import json
 import logging
 import time
+import csv
+from pathlib import Path
 
-# Live-session stand-in. Same Pydantic shape as the real call.
-from .fake_llm import Question, Answer, fake_ask_llm, FakeLLMError
 
+from .settings import Settings, RunSummary
+from .logging_config import get_logger
+log = get_logger()
+
+_settings_for_import = Settings()
+
+if _settings_for_import.use_fake:
+    from .fake_llm import Question, Answer, fake_ask_llm, FakeLLMError
+else:
+    from dotenv import load_dotenv
+    from openai import AsyncOpenAI
+    from pydantic import BaseModel
+
+    load_dotenv()
+
+    _client = AsyncOpenAI()
+
+    class Question(BaseModel):
+        text: str
+
+    class Answer(BaseModel):
+        question: str
+        text: str
+        cost_usd: float
+        retries: int = 0
+
+def load_questions(
+    path: str | Path = "data/questions.csv",
+) -> list[Question]:
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    return [
+        Question(text=row["text"])
+        for row in rows
+        if row.get("text")
+    ]
+
+def summarise_run(
+    answers: list[Answer],
+    *,
+    started_at: float,
+    elapsed: float,
+    fail_rate: float,
+    use_fake: bool,
+) -> RunSummary:
+    return RunSummary(
+        started_at=started_at,
+        elapsed_seconds=elapsed,
+        n_questions=len(answers),
+        n_succeeded=len(answers),
+        n_retries_total=sum(a.retries for a in answers),
+        total_cost_usd=sum(a.cost_usd for a in answers),
+        fail_rate=fail_rate,
+        use_fake=use_fake,
+    )
 
 # ---------- Step 2: one async call ----------
 async def ask_llm(q: Question, fail_rate: float = 0.0) -> Answer:
-    """One call. Live demo: fake. Lab: real AsyncOpenAI (same signature)."""
-    ans = await fake_ask_llm(q, fail_rate=fail_rate)
+    """One call. Fake or real depending on Settings.use_fake."""
+
+    if _settings_for_import.use_fake:
+        ans = await fake_ask_llm(q, fail_rate=fail_rate)
+    else:
+        resp = await _client.chat.completions.create(
+            model=_settings_for_import.model,
+            messages=[
+                {"role": "user", "content": q.text}
+            ],
+        )
+
+        ans = Answer(
+            question=q.text,
+            text=resp.choices[0].message.content,
+            cost_usd=0.0001,
+        )
+
     log.info(f"asked: {q.text[:40]}")
     return ans
-
-    # TODO (Step 5): once logging is configured, also log here, e.g.
-    #                log.info(f"asked: {q.text[:40]}")
     
 
 
@@ -73,37 +142,77 @@ async def run_batch(
     return await asyncio.gather(*tasks)
 
 
+async def run_in_batches(
+    questions: list[Question],
+    batch_size: int = 5,
+    fail_rate: float = 0.0,
+) -> list[Answer]:
+    out: list[Answer] = []
+
+    for i in range(0, len(questions), batch_size):
+        chunk = questions[i : i + batch_size]
+
+        log.info(
+            f"batch {i // batch_size + 1}: {len(chunk)} questions"
+        )
+
+        batch_answers = await asyncio.gather(
+            *(
+                ask_llm_with_retry(q, fail_rate=fail_rate)
+                for q in chunk
+            )
+        )
+
+        out.extend(batch_answers)
+
+        await asyncio.sleep(0.1)
+
+    return out
+
 # ---------- Step 5: structured (JSON) logging ----------
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "ts": round(time.time(), 3),
-            "level": record.levelname,
-            "msg": record.getMessage(),
-        })
 
-
-log = logging.getLogger("pipeline")
-log.setLevel(logging.INFO)
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(JsonFormatter())
-log.addHandler(_handler)
 
 
 # ---------- main ----------
 if __name__ == "__main__":
-    import sys
+    settings = Settings()
 
-    fail_rate = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
-    sample = [
-        Question(text="What is RAG in one sentence?"),
-        Question(text="Name three uses of vector databases."),
-        Question(text="Why might an LLM hallucinate?"),
-    ]
+    questions = load_questions(settings.questions_csv)
+    log.info(f"loaded {len(questions)} questions")
+
     started = time.time()
-    answers = asyncio.run(run_batch(sample, fail_rate=fail_rate))
+
+    answers = asyncio.run(
+        run_in_batches(
+            questions,
+            batch_size=settings.batch_size,
+            fail_rate=settings.fail_rate,
+        )
+    )
+
     elapsed = time.time() - started
-    print(f"\n{len(answers)} answers in {elapsed:.2f}s\n")
-    for a in answers:
-        print(f"- {a.text[:80]}")
+
+    summary = summarise_run(
+        answers,
+        started_at=started,
+        elapsed=elapsed,
+        fail_rate=settings.fail_rate,
+        use_fake=settings.use_fake,
+    )
+
+    log.info(f"summary: {summary.model_dump_json()}")
+
+    settings.results_json.write_text(
+        json.dumps(
+            {
+                "summary": summary.model_dump(mode="json"),
+                "answers": [a.model_dump() for a in answers],
+            },
+            indent=2,
+        )
+    )
+
+    print(
+        f"wrote {len(answers)} answers to "
+        f"{settings.results_json} in {elapsed:.2f}s"
+    )
