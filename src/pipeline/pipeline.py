@@ -29,6 +29,8 @@ from pathlib import Path
 
 from .settings import Settings, RunSummary
 from .logging_config import get_logger
+from .fake_llm import fake_ask_llm
+
 log = get_logger()
 
 _settings_for_import = Settings()
@@ -41,8 +43,7 @@ else:
     from pydantic import BaseModel
 
     load_dotenv()
-
-    _client = AsyncOpenAI()
+    _client = None
 
     class Question(BaseModel):
         text: str
@@ -91,11 +92,14 @@ async def ask_llm(q: Question, fail_rate: float = 0.0) -> Answer:
     if _settings_for_import.use_fake:
         ans = await fake_ask_llm(q, fail_rate=fail_rate)
     else:
+        global _client
+
+        if _client is None:
+            _client = AsyncOpenAI()
+
         resp = await _client.chat.completions.create(
             model=_settings_for_import.model,
-            messages=[
-                {"role": "user", "content": q.text}
-            ],
+            messages=[{"role": "user", "content": q.text}],
         )
 
         ans = Answer(
