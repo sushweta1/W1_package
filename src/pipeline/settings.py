@@ -1,6 +1,11 @@
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+load_dotenv()
+
 
 
 class Settings(BaseModel):
@@ -15,6 +20,13 @@ class Settings(BaseModel):
 
     #after verifying retry behavior, restore the default fail_rate
     fail_rate: float = Field(0.0, ge=0.0, le=1.0)
+
+    openai_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", "")
+    )
+
+    max_retries: int = Field(2, ge=0)
+    retry_delay_s: float = Field(1.0, ge=0.0)
 
     model: str = "gpt-4o-mini"
     #use_fake: bool = True

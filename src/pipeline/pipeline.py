@@ -1,245 +1,204 @@
-"""pipeline.py — Week 2 hands-on starter.
+"""W4 REFERENCE — src/pipeline/pipeline.py
 
-We'll fill in the TODOs together during the live session. The pieces:
-
-    Step 2 — async def ask_llm                 (one call)
-    Step 3 — ask_llm_with_retry                (exponential backoff)
-    Step 4 — run_batch with asyncio.gather     (parallel fan-out)
-    Step 5 — JSON-formatted structured logging
-
-For the live demo we call ``fake_ask_llm`` from ``fake_llm.py`` —
-no API quota, no network flakiness, and a ``fail_rate`` knob so retries
-fire on demand. In the lab you'll swap to the real ``AsyncOpenAI`` client
-(same ``Question``/``Answer`` shape — only one import changes).
-
-Run it (after the TODOs are filled):
-    python pipeline.py           # fail_rate = 0.0  (clean parallel run)
-    python pipeline.py 0.4       # fail_rate = 0.4  (forces retries)
+Final shape after Lab Step 1 + Step 2:
+  • ask_llm uses tool-calling for structured Answer outputs.
+  • stream_answer uses real OpenAI streaming.
+  • Both paths compute real cost_usd from response.usage via cost.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
-import csv
-import argparse
-from pathlib import Path
+from typing import AsyncIterator
 
+from openai import AsyncOpenAI
 
-from .settings import Settings, RunSummary
-from .logging_config import get_logger
-from .fake_llm import fake_ask_llm
+from .cost import compute_cost_usd
+from .models import Answer, Question
+from .settings import Settings
 
-log = get_logger()
-
+logger = logging.getLogger(__name__)
+# Backward compatibility for W2/W3 tests.
 _settings_for_import = Settings()
 
-if _settings_for_import.use_fake:
-    from .fake_llm import Question, Answer, fake_ask_llm, FakeLLMError
-else:
-    from dotenv import load_dotenv
-    from openai import AsyncOpenAI
-    from pydantic import BaseModel
 
-    load_dotenv()
-    _client = None
-
-    class Question(BaseModel):
-        text: str
-
-    class Answer(BaseModel):
-        question: str
-        text: str
-        cost_usd: float
-        retries: int = 0
-
-def load_questions(
-    path: str | Path = "data/questions.csv",
-) -> list[Question]:
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    return [
-        Question(text=row["text"])
-        for row in rows
-        if row.get("text")
-    ]
-
-def summarise_run(
-    answers: list[Answer],
-    *,
-    started_at: float,
-    elapsed: float,
-    fail_rate: float,
-    use_fake: bool,
-) -> RunSummary:
-    return RunSummary(
-        started_at=started_at,
-        elapsed_seconds=elapsed,
-        n_questions=len(answers),
-        n_succeeded=len(answers),
-        n_retries_total=sum(a.retries for a in answers),
-        total_cost_usd=sum(a.cost_usd for a in answers),
-        fail_rate=fail_rate,
-        use_fake=use_fake,
-    )
-
-# ---------- Step 2: one async call ----------
-async def ask_llm(q: Question, fail_rate: float = 0.0) -> Answer:
-    """One call. Fake or real depending on Settings.use_fake."""
-
-    if _settings_for_import.use_fake:
-        ans = await fake_ask_llm(q, fail_rate=fail_rate)
-    else:
-        global _client
-
-        if _client is None:
-            _client = AsyncOpenAI()
-
-        resp = await _client.chat.completions.create(
-            model=_settings_for_import.model,
-            messages=[{"role": "user", "content": q.text}],
-        )
-
-        ans = Answer(
-            question=q.text,
-            text=resp.choices[0].message.content,
-            cost_usd=0.0001,
-        )
-
-    log.info(f"asked: {q.text[:40]}")
-    return ans
-    
+# ─── Tool schema for structured outputs ─────────────────────────────────────
+ANSWER_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "answer_question",
+        "description": (
+            "Return a structured answer with content, confidence, and sources."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The answer in 2-4 sentences.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "How confident you are in the answer, 0.0 to 1.0.",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Source identifiers or URLs you used. Empty list is fine "
+                        "if you used general knowledge."
+                    ),
+                },
+            },
+            "required": ["content", "confidence", "sources"],
+        },
+    },
+}
 
 
-# ---------- Step 3: retry with exponential backoff ----------
+# ─── Fake LLM (kept from W2 for tests) ──────────────────────────────────────
+async def fake_ask_llm(question: str) -> str:
+    """Returns a canned answer with a small delay. Used by tests + offline runs."""
+    await asyncio.sleep(0.05)
+    return f"[FAKE] {question[:60]}"
+
+
+# ─── Real LLM call via tool-calling ─────────────────────────────────────────
+async def ask_llm(q: Question, settings: Settings | None = None) -> Answer:
+    """Call the LLM with tool-calling, returning a structured Answer.
+
+    Retries on transient failures. Real cost computed from response.usage.
+    """
+    # W4 normally passes Settings explicitly.
+    # Falling back to this shared object preserves the W2/W3 test contract.
+    settings = settings or _settings_for_import
+
+    # W4 Question uses .question; older W2/W3 Question used .text.
+    question_text = getattr(q, "question", None)
+    if question_text is None:
+        question_text = getattr(q, "text")
+
+    if settings.use_fake:
+        fake_result = await fake_ask_llm(question_text)
+
+        # Normal W4 fake implementation returns a string.
+        if isinstance(fake_result, str):
+            return Answer(
+                content=fake_result,
+                cost_usd=0.0,
+                retries=0,
+            )
+
+        # Older W3 mocked tests return their original Answer object.
+        return fake_result
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    last_err: Exception | None = None
+
+    for attempt in range(settings.max_retries + 1):
+        try:
+            resp = await client.chat.completions.create(
+                model=settings.model,
+                messages=[{"role": "user", "content": question_text}],
+                tools=[ANSWER_TOOL],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "answer_question"},
+                },
+            )
+
+            # Parse the tool call's structured arguments.
+            tool_calls = resp.choices[0].message.tool_calls or []
+            if not tool_calls:
+                # Defensive — should not happen because tool_choice forces it,
+                # but if a provider misbehaves we want a clear error.
+                raise RuntimeError("LLM did not call the answer_question tool")
+            args_json = tool_calls[0].function.arguments
+            args = json.loads(args_json)
+
+            # Compute real cost from usage.
+            usage = resp.usage
+            cost = compute_cost_usd(
+                settings.model,
+                usage.prompt_tokens if usage else 0,
+                usage.completion_tokens if usage else 0,
+            )
+
+            return Answer(
+                content=args["content"],
+                confidence=args["confidence"],
+                sources=args.get("sources", []),
+                cost_usd=cost,
+                retries=attempt,
+                schema_version="v1",
+            )
+
+        except Exception as exc:
+            last_err = exc
+            if attempt < settings.max_retries:
+                logger.warning(
+                    "ask_llm attempt %d failed: %s — retrying", attempt + 1, exc
+                )
+                await asyncio.sleep(settings.retry_delay_s * (2 ** attempt))
+                continue
+            raise
+
+    raise RuntimeError(f"ask_llm exhausted retries: {last_err}")  # unreachable
+
+
 async def ask_llm_with_retry(
-    q: Question, tries: int = 3, fail_rate: float = 0.0
-) -> Answer:
-    """Retry up to ``tries`` times. Wait 1 s, 2 s, 4 s between attempts."""
+    q,
+    tries: int = 3,
+    fail_rate: float = 0.0,
+):
+    """Backward-compatible W2/W3 retry wrapper."""
 
     for attempt in range(tries):
         try:
-            ans = await ask_llm(q, fail_rate=fail_rate)
-            ans.retries = attempt
-            return ans
-        except Exception as exc:
+            answer = await ask_llm(q)
+
+            if hasattr(answer, "retries"):
+                answer.retries = attempt
+
+            return answer
+
+        except Exception:
             if attempt == tries - 1:
                 raise
 
-            log.warning(
-                f"retry {attempt + 1} for: {q.text[:40]} ({exc})"
-            )
-
-    await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)
 
     raise RuntimeError("Retry loop exited unexpectedly")
 
+# ─── Streaming endpoint ─────────────────────────────────────────────────────
+async def stream_answer(
+    question: str, settings: Settings | None = None
+) -> AsyncIterator[str]:
+    """Yield content tokens as they arrive from the LLM.
 
-# ---------- Step 4: gather it all together ----------
-async def run_batch(
-    questions: list[Question], fail_rate: float = 0.0
-) -> list[Answer]:
-    """Fire all questions in parallel via ``asyncio.gather``."""
+    Real OpenAI streaming — no asyncio.sleep, no word-splitting.
+    """
+    settings = settings or Settings()
 
-    tasks = [ask_llm_with_retry(q, fail_rate=fail_rate) for q in questions]
-    return await asyncio.gather(*tasks)
+    if settings.use_fake:
+        full = await fake_ask_llm(question)
+        for word in full.split(" "):
+            await asyncio.sleep(0.05)
+            yield word + " "
+        return
 
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-async def run_in_batches(
-    questions: list[Question],
-    batch_size: int = 5,
-    fail_rate: float = 0.0,
-) -> list[Answer]:
-    out: list[Answer] = []
-
-    for i in range(0, len(questions), batch_size):
-        chunk = questions[i : i + batch_size]
-
-        log.info(
-            f"batch {i // batch_size + 1}: {len(chunk)} questions"
-        )
-
-        batch_answers = await asyncio.gather(
-            *(
-                ask_llm_with_retry(q, fail_rate=fail_rate)
-                for q in chunk
-            )
-        )
-
-        out.extend(batch_answers)
-
-        await asyncio.sleep(0.1)
-
-    return out
-
-# ---------- Step 5: structured (JSON) logging ----------
-
-
-
-# ---------- main ----------
-if __name__ == "__main__":
-    from .store import connect, write_run, write_answers
-    settings = Settings()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Process only the first N questions",
-    )
-    args = parser.parse_args()
-
-    questions = load_questions(settings.questions_csv)
-
-    if args.limit is not None:
-        questions = questions[:args.limit]
-
-    log.info(f"loaded {len(questions)} questions")
-
-    started = time.time()
-
-    answers = asyncio.run(
-        run_in_batches(
-            questions,
-            batch_size=settings.batch_size,
-            fail_rate=settings.fail_rate,
-        )
+    stream = await client.chat.completions.create(
+        model=settings.model,
+        messages=[{"role": "user", "content": question}],
+        stream=True,
     )
 
-    elapsed = time.time() - started
-
-    summary = summarise_run(
-        answers,
-        started_at=started,
-        elapsed=elapsed,
-        fail_rate=settings.fail_rate,
-        use_fake=settings.use_fake,
-    )
-
-    log.info(f"summary: {summary.model_dump_json()}")
-
-    settings.results_json.write_text(
-        json.dumps(
-            {
-                "summary": summary.model_dump(mode="json"),
-                "answers": [a.model_dump() for a in answers],
-            },
-            indent=2,
-        )
-    )
-
-    with connect(settings.results_db) as con:
-        run_id = write_run(con, summary)
-        n = write_answers(con, run_id, answers)
-
-    log.info(
-        f"persisted run {run_id} with {n} answers to {settings.results_db}"
-    )
-
-    print(
-        f"wrote {len(answers)} answers to "
-        f"{settings.results_json} in {elapsed:.2f}s"
-    )
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content:
+            yield delta.content
